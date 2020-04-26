@@ -172,6 +172,13 @@ ipv4::handle_received_packet(packet p, ethernet_address from) {
         frag_limit_mem();
         auto frag_id = ipv4_frag_id{h.src_ip, h.dst_ip, h.id, h.ip_proto};
         auto& frag = _frags[frag_id];
+
+        // Figure out how much data we have at the beginning of the packet
+        uint64_t initial_start_size = 0;
+        const packet *first_packet = frag.data.first_packet();
+        if (first_packet) {
+            initial_start_size = first_packet->len();
+        }
         if (mf == false) {
             frag.last_frag_received = true;
         }
@@ -181,6 +188,39 @@ ipv4::handle_received_packet(packet p, ethernet_address from) {
             frag.rx_time = clock_type::now();
         }
         auto added_size = frag.merge(h, offset, std::move(p));
+
+        // Figure out how much data we have at the beginning of the packet after merging the new info
+        packet *new_first_packet = frag.data.first_packet();
+        uint64_t new_start_size = 0;
+        if (new_first_packet == nullptr) {
+            new_start_size = new_first_packet->len();
+        }
+
+        if (new_start_size < initial_start_size) {
+            throw std::runtime_error("Head packet shrank after merging new data");
+        }
+
+        auto l4 = _l4[h.ip_proto];
+
+        if (new_start_size > initial_start_size && l4) {
+            assert(new_first_packet); // should be impossible since we need it to have nonzero added;
+            size_t l4_offset = 0;
+            forward_hash hash_data;
+            hash_data.push_back(hton(h.src_ip.ip));
+            hash_data.push_back(hton(h.dst_ip.ip));
+            auto forwarded = l4->partial_forward(hash_data, *new_first_packet, l4_offset);
+            if (forwarded) {
+                auto cpu_id = _netif->hash2cpu(toeplitz_hash(_netif->rss_key(), hash_data));
+                // Here, we only forward to a local receiver. Otherwise, we would have to copy and allocate
+                // new packets over and over at each step of the way
+                //
+                // Instead, we share a ref-counted version of each packet internally
+                if (cpu_id == this_shard_id()) {
+                    l4->partial_received(new_first_packet->share(), h.src_ip, h.dst_ip);
+                }
+            }
+        }
+
         _frag_mem += added_size;
         if (frag.is_complete()) {
             // All the fragments are received
@@ -188,7 +228,6 @@ ipv4::handle_received_packet(packet p, ethernet_address from) {
             auto& ip_data = frag.data.map.begin()->second;
             // Choose a cpu to forward this packet
             auto cpu_id = this_shard_id();
-            auto l4 = _l4[h.ip_proto];
             if (l4) {
                 size_t l4_offset = 0;
                 forward_hash hash_data;

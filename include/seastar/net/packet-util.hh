@@ -43,6 +43,15 @@ public:
         return linearizations_ref();
     }
 
+    packet *first_packet() {
+        auto begin = map.begin();
+        if (begin != map.end() && begin->first == 0) {
+            return &begin->second;
+        } else {
+            return nullptr;
+        }
+    }
+
     void merge(Offset offset, packet p) {
         bool insert = true;
         auto beg = offset;

@@ -376,10 +376,11 @@ private:
             tcp_seq urgent;
             tcp_seq initial;
             std::deque<packet> data;
-            // The total size of data stored in std::deque<packet> data
+            packet _waiting_partial_packet;
             size_t data_size = 0;
             tcp_packet_merger out_of_order;
             compat::optional<promise<>> _data_received_promise;
+            compat::optional<promise<>> _partial_data_received_promise;
             // The maximun memory buffer size allowed for receiving
             // Currently, it is the same as default receive window size when window scaling is enabled
             size_t max_receive_buf_size = 3737600;
@@ -428,14 +429,17 @@ private:
         void input_handle_listen_state(tcp_hdr* th, packet p);
         void input_handle_syn_sent_state(tcp_hdr* th, packet p);
         void input_handle_other_state(tcp_hdr* th, packet p);
+        void input_handle_other_state_partial(tcp_hdr* th, packet p);
         void output_one(bool data_retransmit = false);
         future<> wait_for_data();
+        future<> wait_for_partial_data();
         void abort_reader();
         future<> wait_for_all_data_acked();
         future<> wait_send_available();
         future<> send(packet p);
         void connect();
         packet read();
+        packet read_partial();
         void close();
         void remove_from_tcbs() {
             auto id = connid{_local_ip, _foreign_ip, _local_port, _foreign_port};
@@ -561,6 +565,12 @@ private:
                 _rcv._data_received_promise = {};
             }
         }
+        void signal_partial_data_received() {
+            if (_rcv._partial_data_received_promise) {
+                _rcv._partial_data_received_promise->set_value();
+                _rcv._partial_data_received_promise = {};
+            }
+        }
         void signal_all_data_acked() {
             if (_snd._all_data_acked_promise && _snd.unsent_len == 0) {
                 _snd._all_data_acked_promise->set_value();
@@ -638,6 +648,9 @@ private:
         bool foreign_will_not_send() {
             return in_state(CLOSING | TIME_WAIT | CLOSE_WAIT | LAST_ACK | CLOSED);
         }
+        bool will_create_partial() {
+            return in_state(ESTABLISHED);
+        }
         bool in_state(tcp_state state) {
             return uint16_t(_state) & uint16_t(state);
         }
@@ -689,11 +702,17 @@ public:
         future<> send(packet p) {
             return _tcb->send(std::move(p));
         }
+        packet read() {
+            return _tcb->read();
+        }
         future<> wait_for_data() {
             return _tcb->wait_for_data();
         }
-        packet read() {
-            return _tcb->read();
+        packet read_partial() {
+            return _tcb->read_partial();
+        }
+        future<> wait_for_partial_data() {
+            return _tcb->wait_for_partial_data();
         }
         ipaddr foreign_ip() {
             return _tcb->_foreign_ip;
@@ -749,7 +768,9 @@ public:
 public:
     explicit tcp(inet_type& inet);
     void received(packet p, ipaddr from, ipaddr to);
+    void partial_received(packet p, ipaddr from, ipaddr to);
     bool forward(forward_hash& out_hash_data, packet& p, size_t off);
+    bool partial_forward(forward_hash& out_hash_data, packet& p, size_t off);
     listener listen(uint16_t port, size_t queue_length = 100);
     connection connect(socket_address sa);
     const net::hw_features& hw_features() const { return _inet._inet.hw_features(); }
@@ -850,6 +871,23 @@ bool tcp<InetTraits>::forward(forward_hash& out_hash_data, packet& p, size_t off
     return true;
 }
 
+// This will skip cases where we don't actually get the header, like in above.
+// However, it's ok to miss a partial message, so we assume if we can't get the header
+// that we will then be incorrect
+template <typename InetTraits>
+bool tcp<InetTraits>::partial_forward(forward_hash& out_hash_data, packet& p, size_t off) {
+    auto th = p.get_header(off, tcp_hdr::len);
+    if (th) {
+        // src_port, dst_port in network byte order
+        out_hash_data.push_back(uint8_t(th[0]));
+        out_hash_data.push_back(uint8_t(th[1]));
+        out_hash_data.push_back(uint8_t(th[2]));
+        out_hash_data.push_back(uint8_t(th[3]));
+        return true;
+    }
+    return false;
+}
+
 template <typename InetTraits>
 void tcp<InetTraits>::received(packet p, ipaddr from, ipaddr to) {
     auto th = p.get_header(0, tcp_hdr::len);
@@ -927,6 +965,36 @@ void tcp<InetTraits>::received(packet p, ipaddr from, ipaddr to) {
             // CLOSE_WAIT, CLOSING, LAST_ACK, TIME_WAIT
             return tcbp->input_handle_other_state(&h, std::move(p));
         }
+    }
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::partial_received(packet p, ipaddr from, ipaddr to) {
+    auto th = p.get_header(0, tcp_hdr::len);
+    if (!th) {
+        return;
+    }
+    // data_offset is correct even before ntoh()
+    auto data_offset = uint8_t(th[12]) >> 4;
+    if (size_t(data_offset * 4) < tcp_hdr::len) {
+        return;
+    }
+
+    // Here we skip checksum calculations since we're speculatively checking an existing packet
+
+    auto h = tcp_hdr::read(th);
+    auto id = connid{to, from, h.dst_port, h.src_port};
+    auto tcbi = _tcbs.find(id);
+    lw_shared_ptr<tcb> tcbp;
+
+    // If it's not an existing connection, we just ignore the partial message
+    if (tcbi == _tcbs.end()) {
+        return;
+    } 
+
+    tcbp = tcbi->second;
+    if (tcbp->state() == tcp_state::ESTABLISHED) {
+        return tcbp->input_handle_other_state_partial(&h, std::move(p));
     }
 }
 
@@ -1491,6 +1559,11 @@ void tcp<InetTraits>::tcb::input_handle_other_state(tcp_hdr* th, packet p) {
             _rcv.data_size += p.len();
             _rcv.data.push_back(std::move(p));
             _rcv.next += seg_len;
+
+            // reset the partial packet to nothing, since this packet is the same as our front-of-line packet
+            // We could try and see what's incomplete, and create a future to reset the package as such, but this
+            // seems like an ordering complexity bomb and also a bit pointless
+            _rcv._waiting_partial_packet = packet();
             auto merged = merge_out_of_order();
             _rcv.window = get_modified_receive_window_size();
             signal_data_received();
@@ -1555,6 +1628,68 @@ void tcp<InetTraits>::tcb::input_handle_other_state(tcp_hdr* th, packet p) {
         // Since we will do output, we can canncel scheduled delayed ACK.
         clear_delayed_ack();
         output();
+    }
+}
+
+template <typename InetTraits>
+void tcp<InetTraits>::tcb::input_handle_other_state_partial(tcp_hdr* th, packet p) {
+    p = p.share(th->data_offset * 4, p.len());
+    bool do_output = false;
+    bool do_output_data = false;
+    tcp_seq seg_seq = th->seq;
+    auto seg_ack = th->ack;
+    auto seg_len = p.len();
+
+    // 4.1 first check sequence number
+    if (!segment_acceptable(seg_seq, seg_len)) {
+        return;
+    }
+
+    // Skip anything that isn't clearly the next packet
+    if (seg_seq != _rcv.next) {
+        return;
+    }
+
+    // 4.2 second check the RST bit
+    // Skip if an RST packet
+    if (th->f_rst) {
+        return;
+    }
+
+    // 4.3 third check security and precedence
+    // NOTE: Ignored for now
+
+    // 4.4 fourth, check the SYN bit
+    if (th->f_syn) {
+        return;
+    }
+
+    // 4.5 fifth check the ACK field
+    if (!th->f_ack) {
+        // if the ACK bit is off drop the segment and return
+        return;
+    }
+
+    // sanity check of established state
+    if (!in_state(ESTABLISHED)) {
+        return;
+    }
+
+    // 4.7 seventh, process the segment text
+    // We aready know that we're in an ESTABLISHED state.
+    // Here, we also don't want to do any sort of merging of our packet
+    // Just storing that we have a partial packet and updaing the receiver
+    if (p.len()) {
+        // Normally, we know this is the next packet, so we append to the incoming packets buffer
+        // and also merge.
+        //
+        // We still know it's the next packet, but we don't want to do any sort of merging. Instead, we
+        // just want to set this to be our next-known partial packet, and inform the reader
+        //
+        // There are some minor inefficiencies here in that this packet is shared with the IP reassembler,
+        // so we might do more updates than strictly needed, but it's much safer this way.
+        _rcv->_waiting_partial_packet = std::move(p);
+        signal_partial_data_received();
     }
 }
 
@@ -1720,6 +1855,15 @@ void tcp<InetTraits>::tcb::output_one(bool data_retransmit) {
 }
 
 template <typename InetTraits>
+future<> tcp<InetTraits>::tcb::wait_for_partial_data() {
+    if (_rcv._waiting_partial_packet.len() || !will_create_partial()) {
+        return make_ready_future<>();
+    }
+    _rcv._partial_data_received_promise = promise<>();
+    return _rcv.partial__data_received_promise->get_future();
+}
+
+template <typename InetTraits>
 future<> tcp<InetTraits>::tcb::wait_for_data() {
     if (!_rcv.data.empty() || foreign_will_not_send()) {
         return make_ready_future<>();
@@ -1772,6 +1916,13 @@ packet tcp<InetTraits>::tcb::read() {
     _rcv.data_size = 0;
     _rcv.data.clear();
     _rcv.window = get_default_receive_window_size();
+    return p;
+}
+
+template <typename InetTraits>
+packet tcp<InetTraits>::tcb::read_partial() {
+    packet p;
+    std::swap(p, _rcv._waiting_partial_packet);
     return p;
 }
 
@@ -2045,6 +2196,7 @@ void tcp<InetTraits>::tcb::cleanup() {
     _rcv.out_of_order.map.clear();
     _rcv.data_size = 0;
     _rcv.data.clear();
+    _rcv._waiting_partial_packet = packet();
     stop_retransmit_timer();
     clear_delayed_ack();
     remove_from_tcbs();
