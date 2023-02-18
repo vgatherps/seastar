@@ -83,6 +83,61 @@ BOOST_AUTO_TEST_CASE(test_many_fragments) {
     verify(p);
 }
 
+BOOST_AUTO_TEST_CASE(test_many_fragments_retain_front) {
+    std::vector<char> expected;
+
+    auto append = [&expected](net::packet p, char c, size_t n) {
+        auto tmp = temporary_buffer<char>(n);
+        std::fill_n(tmp.get_write(), n, c);
+        std::fill_n(std::back_inserter(expected), n, c);
+        return net::packet(std::move(p), std::move(tmp));
+    };
+
+    net::packet p;
+    p = append(std::move(p), 'a', 5);
+    p = append(std::move(p), 'b', 31);
+    p = append(std::move(p), 'c', 65);
+    p = append(std::move(p), 'c', 4096);
+    p = append(std::move(p), 'd', 4096);
+
+    auto verify = [&expected](const net::packet &p) {
+        BOOST_CHECK_EQUAL(p.len(), expected.size());
+        auto expected_it = expected.begin();
+        for (auto &&frag : p.fragments()) {
+            BOOST_CHECK_LE(frag.size, static_cast<size_t>(expected.end() - expected_it));
+            BOOST_CHECK(std::equal(frag.base, frag.base + frag.size, expected_it));
+            expected_it += frag.size;
+        }
+    };
+
+    auto retain_front = [&expected](net::packet &p, size_t n) {
+        p.retain_front(n);
+        expected.erase(expected.begin() + n, expected.end());
+    };
+
+    verify(p);
+
+    retain_front(p, 1024);
+    verify(p);
+
+    retain_front(p, 29);
+    verify(p);
+
+    retain_front(p, 6);
+    verify(p);
+
+    retain_front(p, 1);
+    verify(p);
+
+    net::packet p2;
+    p2 = append(std::move(p2), 'z', 9);
+    p2 = append(std::move(p2), 'x', 7);
+
+    p.append(std::move(p2));
+
+    verify(p);
+}
+
 BOOST_AUTO_TEST_CASE(test_headers_are_contiguous) {
     using tcp_header = std::array<char, 20>;
     using ip_header = std::array<char, 20>;

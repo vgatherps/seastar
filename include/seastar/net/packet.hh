@@ -249,6 +249,7 @@ public:
     void append(packet&& p);
 
     void trim_front(size_t how_much) noexcept;
+    void retain_front(size_t how_much) noexcept;
     void trim_back(size_t how_much) noexcept;
 
     // get a header pointer, linearizing if necessary
@@ -543,6 +544,30 @@ void packet::trim_front(size_t how_much) noexcept {
         }
         _impl->_frags[0].base += how_much;
         _impl->_frags[0].size -= how_much;
+    }
+}
+
+inline
+void packet::retain_front(size_t how_much) noexcept {
+    assert(how_much <= _impl->_len);
+    if (how_much == _impl->_len) {
+        return;
+    }
+    _impl->_len = how_much;
+    size_t i = 0;
+    while (how_much && how_much >= _impl->_frags[i].size) {
+        how_much -= _impl->_frags[i++].size;
+    }
+    if (!_impl->using_internal_data()) {
+        _impl->_headroom = internal_data_size;
+    } else {
+        _impl->_headroom = internal_data_size - how_much;
+    }
+    if (how_much) {
+        _impl->_nr_frags = i + 1;
+        _impl->_frags[i].size = how_much;
+    } else {
+        _impl->_nr_frags = i;
     }
 }
 
